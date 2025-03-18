@@ -1,0 +1,430 @@
+import os
+import json
+import pandas as pd
+from collections import defaultdict
+
+def process_game_file(filepath):
+    """Process a single game file and extract Cubs player stats."""
+    with open(filepath, 'r') as f:
+        try:
+            game_data = json.load(f)
+            
+            # Identify which team is the Cubs
+            away_team = game_data.get('gameData', {}).get('teams', {}).get('away', {})
+            home_team = game_data.get('gameData', {}).get('teams', {}).get('home', {})
+            
+            cubs_team_data = None
+            cubs_is_home = False
+            
+            if away_team.get('name') == "Chicago Cubs":
+                cubs_team_data = away_team
+            elif home_team.get('name') == "Chicago Cubs":
+                cubs_team_data = home_team
+                cubs_is_home = True
+            
+            if not cubs_team_data:
+                return None  # Cubs not playing in this game
+            
+            # Extract the game date
+            game_date = game_data.get('gameData', {}).get('datetime', {}).get('officialDate')
+            game_id = game_data.get('gameData', {}).get('game', {}).get('pk')
+            
+            # Get the boxscore data
+            boxscore = game_data.get('liveData', {}).get('boxscore', {})
+            
+            # Determine which team's data to use from the boxscore
+            team_key = 'home' if cubs_is_home else 'away'
+            cubs_boxscore = boxscore.get('teams', {}).get(team_key, {})
+            
+            # Get player data
+            player_data = cubs_boxscore.get('players', {})
+            
+            # Game result info
+            game_result = {
+                'game_id': game_id,
+                'date': game_date,
+                'opponent': home_team.get('name') if not cubs_is_home else away_team.get('name'),
+                'is_home': cubs_is_home
+            }
+            
+            # Try to get the score
+            linescore = game_data.get('liveData', {}).get('linescore', {})
+            if linescore:
+                teams_score = linescore.get('teams', {})
+                cubs_runs = teams_score.get(team_key, {}).get('runs', 0)
+                opponent_runs = teams_score.get('away' if cubs_is_home else 'home', {}).get('runs', 0)
+                game_result['cubs_score'] = cubs_runs
+                game_result['opponent_score'] = opponent_runs
+                game_result['result'] = 'W' if cubs_runs > opponent_runs else 'L' if cubs_runs < opponent_runs else 'T'
+            
+            # Process position players and pitchers separately
+            position_players_stats = {}
+            pitchers_stats = {}
+            
+            for player_id, player_info in player_data.items():
+                # Skip items that don't have person data
+                if 'person' not in player_info:
+                    continue
+                
+                person = player_info.get('person', {})
+                player_id = person.get('id')
+                player_name = person.get('fullName')
+                
+                # Skip if we can't identify the player
+                if not player_id or not player_name:
+                    continue
+                
+                # Get player stats for this game
+                stats = player_info.get('stats', {})
+                
+                # Determine if player is a pitcher or position player for this game
+                # We'll consider a player a pitcher if they have pitching stats for the game
+                if 'pitching' in stats and stats['pitching']:
+                    pitching_stats = stats.get('pitching', {})
+                    if pitching_stats:  # Check if pitching stats exist and aren't empty
+                        pitchers_stats[player_id] = {
+                            'player_id': player_id,
+                            'name': player_name,
+                            'game_id': game_id,
+                            'game_date': game_date,
+                            **pitching_stats
+                        }
+                
+                # For position players, use batting stats
+                if 'batting' in stats and stats['batting']:
+                    batting_stats = stats.get('batting', {})
+                    if batting_stats:  # Check if batting stats exist and aren't empty
+                        position_players_stats[player_id] = {
+                            'player_id': player_id,
+                            'name': player_name,
+                            'game_id': game_id,
+                            'game_date': game_date,
+                            **batting_stats
+                        }
+            
+            return {
+                'game_info': game_result,
+                'position_players': position_players_stats,
+                'pitchers': pitchers_stats
+            }
+            
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON from file: {filepath}")
+            return None
+        except Exception as e:
+            print(f"Error processing file {filepath}: {str(e)}")
+            return None
+
+def aggregate_player_stats(all_games_data):
+    """Aggregate stats for all players across all games."""
+    position_players_aggregated = defaultdict(lambda: {'name': '', 'games': 0, 'stats': defaultdict(int)})
+    pitchers_aggregated = defaultdict(lambda: {'name': '', 'games': 0, 'stats': defaultdict(int)})
+    
+    for game_data in all_games_data:
+        if not game_data:
+            continue
+            
+        # Process position players
+        for player_id, player_game_stats in game_data['position_players'].items():
+            player_name = player_game_stats.get('name', 'Unknown')
+            position_players_aggregated[player_id]['name'] = player_name
+            position_players_aggregated[player_id]['games'] += 1
+            
+            # Aggregate numeric stats
+            for stat_key, stat_value in player_game_stats.items():
+                if stat_key not in ['player_id', 'name', 'game_id', 'game_date']:
+                    try:
+                        # Try to convert to numeric value
+                        if isinstance(stat_value, (int, float)):
+                            position_players_aggregated[player_id]['stats'][stat_key] += stat_value
+                        elif isinstance(stat_value, str) and stat_value.replace('.', '', 1).isdigit():
+                            position_players_aggregated[player_id]['stats'][stat_key] += float(stat_value)
+                    except (ValueError, TypeError):
+                        # For non-numeric stats, we'll just keep the most recent value
+                        position_players_aggregated[player_id]['stats'][stat_key] = stat_value
+        
+        # Process pitchers
+        for player_id, player_game_stats in game_data['pitchers'].items():
+            player_name = player_game_stats.get('name', 'Unknown')
+            pitchers_aggregated[player_id]['name'] = player_name
+            pitchers_aggregated[player_id]['games'] += 1
+            
+            # Aggregate numeric stats
+            for stat_key, stat_value in player_game_stats.items():
+                if stat_key not in ['player_id', 'name', 'game_id', 'game_date']:
+                    try:
+                        # Try to convert to numeric value
+                        if isinstance(stat_value, (int, float)):
+                            pitchers_aggregated[player_id]['stats'][stat_key] += stat_value
+                        elif isinstance(stat_value, str) and stat_value.replace('.', '', 1).isdigit():
+                            pitchers_aggregated[player_id]['stats'][stat_key] += float(stat_value)
+                    except (ValueError, TypeError):
+                        # For non-numeric stats, we'll just keep the most recent value
+                        pitchers_aggregated[player_id]['stats'][stat_key] = stat_value
+    
+    return position_players_aggregated, pitchers_aggregated
+
+def calculate_derived_stats(position_players, pitchers):
+    """Calculate derived stats like AVG, OBP, ERA, etc."""
+    # Position player derived stats
+    for player_id, player_data in position_players.items():
+        stats = player_data['stats']
+        
+        # Batting Average
+        hits = stats.get('hits', 0)
+        at_bats = stats.get('atBats', 0)
+        stats['avg'] = round(hits / at_bats, 3) if at_bats > 0 else 0.000
+        
+        # On-base Percentage
+        walks = stats.get('baseOnBalls', 0)
+        hit_by_pitch = stats.get('hitByPitch', 0)
+        sac_flies = stats.get('sacFlies', 0)
+        plate_appearances = at_bats + walks + hit_by_pitch + sac_flies
+        stats['obp'] = round((hits + walks + hit_by_pitch) / plate_appearances, 3) if plate_appearances > 0 else 0.000
+        
+        # Slugging Percentage
+        doubles = stats.get('doubles', 0)
+        triples = stats.get('triples', 0)
+        home_runs = stats.get('homeRuns', 0)
+        total_bases = hits + doubles + (2 * triples) + (3 * home_runs)
+        stats['slg'] = round(total_bases / at_bats, 3) if at_bats > 0 else 0.000
+        
+        # OPS
+        stats['ops'] = round(stats['obp'] + stats['slg'], 3)
+    
+    # Pitcher derived stats
+    for player_id, player_data in pitchers.items():
+        stats = player_data['stats']
+        
+        # ERA (Earned Run Average)
+        earned_runs = stats.get('earnedRuns', 0)
+        innings_pitched_str = stats.get('inningsPitched', '0.0')
+        
+        # Convert innings pitched to a decimal value
+        try:
+            innings = 0.0
+            if isinstance(innings_pitched_str, str):
+                if '.' in innings_pitched_str:
+                    whole, fraction = innings_pitched_str.split('.')
+                    innings = float(whole) + float(fraction) / 3
+                else:
+                    innings = float(innings_pitched_str)
+            else:
+                innings = float(innings_pitched_str)
+            
+            stats['innings_decimal'] = innings  # Store the decimal value for calculations
+            stats['era'] = round((earned_runs * 9) / innings, 2) if innings > 0 else 0.00
+        except:
+            stats['innings_decimal'] = 0.0
+            stats['era'] = 0.00
+        
+        # WHIP (Walks + Hits per Inning Pitched)
+        walks = stats.get('baseOnBalls', 0)
+        hits = stats.get('hits', 0)
+        stats['whip'] = round((walks + hits) / stats['innings_decimal'], 2) if stats['innings_decimal'] > 0 else 0.00
+        
+        # K/9 (Strikeouts per 9 innings)
+        strikeouts = stats.get('strikeOuts', 0)
+        stats['k9'] = round((strikeouts * 9) / stats['innings_decimal'], 2) if stats['innings_decimal'] > 0 else 0.00
+        
+        # K/BB (Strikeout to Walk Ratio)
+        stats['kbb'] = round(strikeouts / walks, 2) if walks > 0 else float('inf')
+    
+    return position_players, pitchers
+
+def format_results(position_players, pitchers):
+    """Format the results into readable DataFrames."""
+    # Position players
+    position_player_records = []
+    for player_id, player_data in position_players.items():
+        # Create a basic record with common fields
+        record = {
+            'Player ID': player_id,
+            'Name': player_data['name'],
+            'Games': player_data['games'],
+            'AB': player_data['stats'].get('atBats', 0),
+            'R': player_data['stats'].get('runs', 0),
+            'H': player_data['stats'].get('hits', 0),
+            '2B': player_data['stats'].get('doubles', 0),
+            '3B': player_data['stats'].get('triples', 0),
+            'HR': player_data['stats'].get('homeRuns', 0),
+            'RBI': player_data['stats'].get('rbi', 0),
+            'BB': player_data['stats'].get('baseOnBalls', 0),
+            'SO': player_data['stats'].get('strikeOuts', 0),
+            'SB': player_data['stats'].get('stolenBases', 0),
+            'AVG': f"{player_data['stats'].get('avg', 0.000):.3f}",
+            'OBP': f"{player_data['stats'].get('obp', 0.000):.3f}",
+            'SLG': f"{player_data['stats'].get('slg', 0.000):.3f}",
+            'OPS': f"{player_data['stats'].get('ops', 0.000):.3f}"
+        }
+        
+        # Add all other stats to the record
+        for stat_key, stat_value in player_data['stats'].items():
+            if stat_key not in record:
+                # Format floating point values to be more readable
+                if isinstance(stat_value, float):
+                    record[stat_key] = f"{stat_value:.3f}" if stat_key in ['avg', 'obp', 'slg', 'ops'] else stat_value
+                else:
+                    record[stat_key] = stat_value
+                    
+        position_player_records.append(record)
+    
+    # Pitchers
+    pitcher_records = []
+    for player_id, player_data in pitchers.items():
+        # Create a basic record with common fields
+        record = {
+            'Player ID': player_id,
+            'Name': player_data['name'],
+            'Games': player_data['games'],
+            'W': player_data['stats'].get('wins', 0),
+            'L': player_data['stats'].get('losses', 0),
+            'ERA': f"{player_data['stats'].get('era', 0.00):.2f}",
+            'G': player_data['stats'].get('gamesPlayed', 0),
+            'GS': player_data['stats'].get('gamesStarted', 0),
+            'SV': player_data['stats'].get('saves', 0),
+            'IP': player_data['stats'].get('inningsPitched', '0.0'),
+            'H': player_data['stats'].get('hits', 0),
+            'R': player_data['stats'].get('runs', 0),
+            'ER': player_data['stats'].get('earnedRuns', 0),
+            'HR': player_data['stats'].get('homeRuns', 0),
+            'BB': player_data['stats'].get('baseOnBalls', 0),
+            'SO': player_data['stats'].get('strikeOuts', 0),
+            'WHIP': f"{player_data['stats'].get('whip', 0.00):.2f}",
+            'K/9': f"{player_data['stats'].get('k9', 0.00):.2f}",
+            'K/BB': f"{player_data['stats'].get('kbb', 0.00):.2f}"
+        }
+        
+        # Add all other stats to the record
+        for stat_key, stat_value in player_data['stats'].items():
+            if stat_key not in record:
+                # Format floating point values to be more readable
+                if isinstance(stat_value, float):
+                    record[stat_key] = f"{stat_value:.2f}" if stat_key in ['era', 'whip', 'k9', 'kbb'] else stat_value
+                else:
+                    record[stat_key] = stat_value
+                    
+        pitcher_records.append(record)
+    
+    position_df = pd.DataFrame(position_player_records)
+    pitcher_df = pd.DataFrame(pitcher_records)
+    
+    # Sort the DataFrames by relevant stats
+    if not position_df.empty:
+        position_df = position_df.sort_values('OPS', ascending=False)
+    
+    if not pitcher_df.empty:
+        pitcher_df = pitcher_df.sort_values('ERA')
+    
+    return position_df, pitcher_df
+
+def save_results(position_df, pitcher_df, output_dir='.'):
+    """Save the results to CSV files."""
+    # Save position players stats
+    position_file = os.path.join(output_dir, 'cubs_position_players_stats.csv')
+    position_df.to_csv(position_file, index=False)
+    print(f"Saved all position player stats to: {position_file}")
+    
+    # Save all pitcher stats
+    pitcher_file = os.path.join(output_dir, 'cubs_pitchers_stats.csv')
+    pitcher_df.to_csv(pitcher_file, index=False)
+    print(f"Saved all pitcher stats to: {pitcher_file}")
+    
+    # Save raw data (all stats) for both categories
+    position_raw_file = os.path.join(output_dir, 'cubs_position_players_all_stats.csv')
+    pitcher_raw_file = os.path.join(output_dir, 'cubs_pitchers_all_stats.csv')
+    
+    # Create a full stats dataframe for position players including all columns
+    position_df.to_csv(position_raw_file, index=False)
+    print(f"Saved complete position player stats to: {position_raw_file}")
+    
+    # Create a full stats dataframe for pitchers including all columns
+    pitcher_df.to_csv(pitcher_raw_file, index=False)
+    print(f"Saved complete pitcher stats to: {pitcher_raw_file}")
+    
+    return (position_file, pitcher_file, position_raw_file, pitcher_raw_file)
+
+def analyze_cubs_season(data_folder, output_folder='.'):
+    """Main function to analyze Cubs season data."""
+    print(f"Analyzing Cubs season data from {data_folder}...")
+    
+    # Get all JSON files in the folder
+    json_files = [os.path.join(data_folder, f) for f in os.listdir(data_folder) 
+                 if f.endswith('.json') and os.path.isfile(os.path.join(data_folder, f))]
+    
+    print(f"Found {len(json_files)} JSON files to process.")
+    
+    # Process each game file
+    all_games_data = []
+    for i, json_file in enumerate(json_files):
+        print(f"Processing file {i+1}/{len(json_files)}: {os.path.basename(json_file)}")
+        game_data = process_game_file(json_file)
+        if game_data:
+            all_games_data.append(game_data)
+    
+    print(f"Successfully processed {len(all_games_data)} Cubs games.")
+    
+    # Aggregate player stats
+    print("Aggregating player statistics...")
+    position_players, pitchers = aggregate_player_stats(all_games_data)
+    
+    # Calculate derived stats
+    print("Calculating derived statistics...")
+    position_players, pitchers = calculate_derived_stats(position_players, pitchers)
+    
+    # Format the results
+    print("Formatting results...")
+    position_df, pitcher_df = format_results(position_players, pitchers)
+    
+    # Create a directory for CSV exports if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Save the results
+    print("Saving results to CSV files...")
+    position_path, pitcher_path, position_raw_path, pitcher_raw_path = save_results(position_df, pitcher_df, output_folder)
+    
+    print(f"Analysis complete!")
+    print(f"Position players stats saved to: {position_path}")
+    print(f"Pitchers stats saved to: {pitcher_path}")
+    print(f"Full position player stats saved to: {position_raw_path}")
+    print(f"Full pitcher stats saved to: {pitcher_raw_path}")
+    
+    return position_df, pitcher_df
+
+if __name__ == "__main__":
+    # Edit this path to the folder containing Cubs game data JSON files
+    DATA_FOLDER = "your_folder_name"
+    
+    # Run the analysis
+    position_df, pitcher_df = analyze_cubs_season(DATA_FOLDER)
+    
+    # Display the results
+    print("\nTop 10 Position Players by OPS:")
+    print(position_df.head(10))
+    
+    print("\nTop 10 Pitchers by ERA:")
+    # Convert innings pitched to numerical format for filtering
+    def convert_ip_to_numeric(ip_string):
+        try:
+            if isinstance(ip_string, str):
+                if '.' in ip_string:
+                    whole, fraction = ip_string.split('.')
+                    return float(whole) + float(fraction) / 3
+                else:
+                    return float(ip_string)
+            return float(ip_string)
+        except:
+            return 0.0
+    
+    # Add a numerical innings pitched column for filtering
+    pitcher_df['IP_numeric'] = pitcher_df['IP'].apply(convert_ip_to_numeric)
+    
+    # Filter pitchers with at least 10 innings pitched
+    qualified_pitchers = pitcher_df[pitcher_df['IP_numeric'] >= 10].sort_values('ERA')
+    
+    # Display qualified pitchers
+    if not qualified_pitchers.empty:
+        print(qualified_pitchers[['Name', 'G', 'IP', 'ERA', 'WHIP', 'SO', 'BB']].head(10))
+    else:
+        print("No pitchers with at least 10 IP found.")
+        print(pitcher_df[['Name', 'G', 'IP', 'ERA', 'WHIP', 'SO', 'BB']].head(10))
